@@ -71,7 +71,7 @@ try:
 
 ## Functions
 |Status | Function | Args | Description | Return |
-|--|--|--|--|
+|--|--|--|--|--|
 | implemented | get_firmware |  | Gets firmware info about the router | [Firmware](#firmware) |
 | TODO | get_status |  | Gets status about the router info including wifi statuses and wifi clients info | [Status](#status) |
 | TODO | get_full_info |  | Gets firmware and status info | tuple[[Firmware](#firmware),[Status](#status)] |
@@ -80,9 +80,9 @@ try:
 | implemented | get_ipv4_dhcp_leases | | Gets IPv4 addresses assigned via DHCP | [[IPv4DHCPLease]](#IPv4DHCPLease) | 
 | TODO | set_wifi | wifi: [Wifi](#wifi), enable: bool | Allow to turn on/of 4 wifi networks |  |
 | TODO | reboot |  | reboot router |
-| implemented || connect |  | authorize for actions |
-| implemented || logout |  | logout after all is done |
-| todo || query | query, operation='operation=read' | execute cgi-bin query | dictionary of result or None |
+| implemented | connect |  | authorize for actions |
+| implemented | logout |  | logout after all is done |
+| todo | query | query, operation='operation=read' | execute cgi-bin query | dictionary of result or None |
 
 ## Dataclass
 ### <a id="firmware">Firmware</a>
