@@ -1,8 +1,7 @@
-# [WIP] TP-Link Router API
+# [WIP] TP-Link Router GDPR API
 Python package for API access and management for TP-Link Router using the "GDPR Proxy"
 
-[![Pypi](https://img.shields.io/pypi/v/tplinkrouterc6u)](https://pypi.org/project/tplinkrouterc6u/)
-[![Downloads](https://static.pepy.tech/personalized-badge/tplinkrouterc6u?period=total&units=international_system&left_color=grey&right_color=orange&left_text=Downloads)](https://pypi.org/project/tplinkrouterc6u/)
+Based on [TP-Link Router API](https://github.com/AlexandrErohin/TP-Link-Archer-C6U) and [TP-Link TD-W9960 API client](https://github.com/Electry/TPLink-W9960-APIClient)
 
 See [Supported routers](#supports)
 
@@ -18,7 +17,7 @@ See [Supported routers](#supports)
 Enter the host & credentials used to log in to your router management page. Username is admin by default. But you may pass username as third parameter
 
 ```python
-from tplinkroutergdpr import TplinkRouter, Wifi
+from tplinkroutergdpr import TplinkRouterGDPR, Wifi
 from logging import Logger
 
 router = TplinkRouterGDPR('http://192.168.0.1', 'password')
@@ -54,14 +53,15 @@ So before action client authorize and after logout
 To reduce authorization requests client allows to make several actions with one authorization
 
 ```python
-from tplinkroutergdpr import TplinkRouter, Wifi
+from tplinkroutergdpr import TplinkRouterGDPR, Wifi
 
-router = TplinkRouterGDPR('http://192.168.0.1', 'password', timeout)
+router = TplinkRouterGDPR('http://192.168.0.1')
+router.connect('password',logout_others = True)
 router.single_request_mode = False  # make client use single authorization
 
 
 try:
-    if router.authorize():  # authorizing
+    if router.connect('password',logout_others = True):  # authorizing
         status = router.get_status()
         if not status.guest_2g_enable:  # check if guest 2.4G wifi is disable
             router.set_wifi(Wifi.WIFI_GUEST_2G, True)  # turn on guest 2.4G wifi
@@ -80,7 +80,7 @@ try:
 | implemented | get_ipv4_dhcp_leases | | Gets IPv4 addresses assigned via DHCP | [[IPv4DHCPLease]](#IPv4DHCPLease) | 
 | TODO | set_wifi | wifi: [Wifi](#wifi), enable: bool | Allow to turn on/of 4 wifi networks |  |
 | TODO | reboot |  | reboot router |
-| implemented | connect |  | authorize for actions |
+| implemented | connect | (string)password: your router password, (bool)logout_others | authorize for actions |
 | implemented | logout |  | logout after all is done |
 | todo | query | query, operation='operation=read' | execute cgi-bin query | dictionary of result or None |
 
@@ -186,52 +186,6 @@ try:
 
 ## <a id="supports">Supported routers</a>
 ### Fully tested Hardware Versions
-- Archer A7 V5
-- Archer AX10 v1.0
-- Archer AX20 v1.0
-- Archer AX21 v1.20
-- Archer AX50 v1.0
-- Archer AX55 V1.60
-- Archer AX73 V1
-- Archer AX3000 V1
-- Archer AX6000 V1
-- Archer AX11000 V1
-- Archer C6 v2.0
-- Archer C6 v3.0
-- Archer C6U v1.0
-- Archer C7 v5.0
-- TL-WA3001 v1.0
-
-### Not fully tested Hardware Versions
-- AD7200 V2
-- Archer A6 (V2 and V3)
-- Archer A9 V6
-- Archer A10 (V1 and V2)
-- Archer A20 (V1, V3)
-- Archer C7 V4
-- Archer C8 (V3 and V4)
-- Archer C9 (V4 and V5)
-- Archer C59 V2
-- Archer C90 V6
-- Archer C900 V1
-- Archer C1200 V3 (V2 - should work, but not have been tested)
-- Archer C1900 V2
-- Archer C2300 (V1, V2)
-- Archer C4000 (V2 and V3)
-- Archer C5400 V2
-- Archer C5400X V1
-- TL-WR1043N V5
+- Archer VR2100v
 
 Please let me know if you have tested integration with one of this or other model. Open an issue with info about router's model, hardware and firmware versions.
-
-## Local Development
-
-- Download this repository.
-- Run `pip install -e path/to/repo`.
-- Make changes to files within the `tplinkrouter6u` directory.
-- Exercise the changes following the "Usage" section above.
-
-The sanity check test.py illustrates a few tests and runs through a list of queries in queries.txt creating logs of the results of each query in the logs folder. This can be used to capture the dictionary output of all cgi-bin form submissions.
-
-## Thanks To
- - [EncryptionWrapper for TP-Link Archer C6U](https://github.com/ericpignet/home-assistant-tplink_router/pull/42/files) by [@Singleton-95](https://github.com/Singleton-95)
