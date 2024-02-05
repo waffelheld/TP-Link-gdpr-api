@@ -4,14 +4,14 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="tplinkrouterc6u",
-    version="2.0.1",
-    author="Alex Erohin",
-    author_email="alexanderErohin@yandex.ru",
-    description="TP-Link Router API",
+    name="TplinkRoutergdpr",
+    version="0.1",
+    author="Simon ZAbienski",
+    author_email="tcollect@szab.de",
+    description="TP-Link Router GDPR API",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/AlexandrErohin/TP-Link-Archer-C6U",
+    url="https://github.dev/waffelheld/TP-Link-gdpr-api/",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

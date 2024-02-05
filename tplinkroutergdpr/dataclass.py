@@ -1,7 +1,7 @@
 import macaddress
 import ipaddress
 from dataclasses import dataclass, field
-from tplinkrouterc6u.enum import Wifi
+from tplinkroutergdpr.enum import Wifi
 
 
 @dataclass

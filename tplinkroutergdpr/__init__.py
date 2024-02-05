@@ -1,3 +1,3 @@
-from tplinkrouterc6u.client import TplinkRouter
-from tplinkrouterc6u.enum import Wifi
-from tplinkrouterc6u.dataclass import Firmware, Status, Device
+from tplinkroutergdpr.client import TplinkRouterGDPR
+from tplinkroutergdpr.enum import Wifi
+from tplinkroutergdpr.dataclass import Firmware, Status, Device

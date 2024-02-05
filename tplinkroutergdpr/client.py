@@ -5,390 +5,621 @@ import json
 import requests
 import macaddress
 import ipaddress
-from logging import Logger
-from tplinkrouterc6u.encryption import EncryptionWrapper
-from tplinkrouterc6u.enum import Wifi
-from tplinkrouterc6u.dataclass import Firmware, Status, Device, IPv4Reservation, IPv4DHCPLease, IPv4Status
+import logging
+from tplinkroutergdpr.encryption import EncryptionWrapper
+from tplinkroutergdpr.enum import Wifi
+from tplinkroutergdpr.dataclass import Firmware, Status, Device, IPv4Reservation, IPv4DHCPLease, IPv4Status
+import binascii
+import time
+import random
+import urllib
+from Crypto.Cipher import AES
+from Crypto.Cipher import PKCS1_v1_5
+from Crypto.PublicKey import RSA
+from Crypto.Util.number import bytes_to_long, long_to_bytes
+from Crypto.Util.Padding import pad, unpad
+from Crypto.Hash import MD5
+from base64 import b64encode, b64decode
 
+import pprint
 
-class TplinkRouter:
-    def __init__(self, host: str, password: str, username: str = 'admin', logger: Logger = None,
-                 verify_ssl: bool = True, timeout: int = 10) -> None:
+class LoginException(Exception):
+    pass
+
+class UserConflictException(LoginException):
+    pass
+    
+class TplinkRouterGDPR:
+    RSA_USE_PKCS_V1_5 = False # no padding for the W9960
+    REQUEST_RETRIES = 3
+
+    AES_KEY_LEN = 128 // 8
+    AES_IV_LEN = 16
+
+    HEADERS = {
+        'Accept': '*/*',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:90.0) Gecko/20100101 Firefox/90.0',
+        'Referer': 'http://192.168.1.1/' # updated on the fly
+    }
+
+    HTTP_RET_OK = 0
+    HTTP_ERR_CGI_INVALID_ANSI = 71017
+    HTTP_ERR_USER_PWD_NOT_CORRECT = 71233
+    HTTP_ERR_USER_BAD_REQUEST = 71234
+
+    ACT_GET = 1
+    ACT_SET = 2
+    ACT_ADD = 3
+    ACT_DEL = 4
+    ACT_GL = 5
+    ACT_GS = 6
+    ACT_OP = 7
+    ACT_CGI = 8
+
+    REGEX_TOKEN = r'<script type="text\/javascript">var token="(.*)";<\/script>'
+    REGEX_RETURN_VALUE = r'\$\.ret=(.*);'
+    REGEX_GET_PARM = 'var ee="(.*)";\nvar nn="(.*)";\nvar seq="(.*)";'
+    REGEX_GET_BUSY = 'var isLogined=([01]);\nvar isBusy=([01]);'
+    REGEX_PWD_NOT_CORRENT_INFO = 'var currAuthTimes=(.*);\nvar currForbidTime=(.*);'
+
+    class ActItem:
+        def __init__(self, type, oid, stack = '0,0,0,0,0,0', pstack = '0,0,0,0,0,0', attrs = []):
+            self.type = type
+            self.oid = oid
+            self.stack = stack
+            self.pstack = pstack
+            self.attrs = attrs
+
+    def __init__(self, host, log_level = logging.INFO):
+        logging.basicConfig()
+        self.logger = logging.getLogger(__name__)
+        self.logger.setLevel(log_level)
+
+        self.req = requests.Session()
+
         self.host = host
-        if not (self.host.startswith('http://') or self.host.startswith('https://')):
-            self.host = "http://{}".format(self.host)
-        self._verify_ssl = verify_ssl
-        if self._verify_ssl is False:
-            requests.packages.urllib3.disable_warnings()
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.single_request_mode = True
-        self._logger = logger
+        self.token = None
 
-        self._stok = ''
-        self._sysauth = ''
+        self.aes_key = None
+        self.rsa_key = None
+        self.seq = None
 
-        self._logged = False
-        self._seq = ''
-        self._hash = hashlib.md5((self.username + self.password).encode()).hexdigest()
+    def get_url(self, endpoint, params = {}, include_ts = True):
+        # add timestamp param
+        if include_ts:
+            params['_'] = str(round(time.time() * 1000))
 
-        self.nn = ''
-        self.ee = ''
+        # format params into a string
+        params_arr = []
+        for attr, value in params.items():
+            params_arr.append('{}={}'.format(attr, value))
 
-        self._pwdNN = ''
-        self._pwdEE = ''
+        # format url
+        return 'http://{}/{}{}{}'.format(
+            self.host,
+            endpoint,
+            '?' if len(params_arr) > 0 else '',
+            '&'.join(params_arr)
+        )
 
-        self._encryption = EncryptionWrapper()
+    def connect(self, password, logout_others = False):
+        '''
+        Establishes a login session to the host using provided credentials
+        '''
+        # hash the password
+        self.md5_hash_pw = self.__hash_pw('admin', password)
 
-    def get_firmware(self) -> Firmware | None:
-        return self._request(self._get_firmware)
+        # request the RSA public key from the host
+        (self.rsa_key, self.seq) = self.__req_rsa_key()
 
-    def get_status(self) -> Status | None:
-        return self._request(self._get_status)
+        # check busy status
+        (is_logged_in, is_busy) = self.__req_check_busy()
 
-    def get_ipv4_status(self) -> IPv4Status | None:
-        return self._request(self._get_ipv4_status)
+        if logout_others is False and is_logged_in:
+            raise UserConflictException('Login conflict. Someone else is logged in.')
 
-    def get_ipv4_reservations(self) -> [IPv4Reservation]:
-        return self._request(self._get_ipv4_reservations)
+        # TODO: Handle is_busy ...
 
-    def get_ipv4_dhcp_leases(self) -> [IPv4DHCPLease]:
-        return self._request(self._get_ipv4_dhcp_leases)
+        # generate AES key
+        self.aes_key = self.__gen_aes_key()
 
-    def query(self, query, operation='operation=read'):
-        def callback():
-            return self._get_data(query, operation)
+        # authenticate
+        self.__req_login('admin', password)
 
-        return self._request(callback)
+        # request TokenID
+        self.token = self.__req_token()
 
-    def get_full_info(self) -> tuple[Firmware, Status] | None:
-        def callback():
-            firmware = self._get_firmware()
-            status = self._get_status()
+    def logout(self):
+        '''
+        Logs out from the host
+        '''
+        if self.token is None:
+            return False
 
-            return firmware, status
+        acts = [
+            # 8\r\n[/cgi/logout#0,0,0,0,0,0#0,0,0,0,0,0]0,0\r\n
+            self.ActItem(self.ACT_CGI, '/cgi/logout')
+        ]
 
-        return self._request(callback)
+        response, _ = self.__req_act(acts)
+        ret_code = self.__parse_ret_val(response)
 
-    def set_wifi(self, wifi: Wifi, enable: bool) -> None:
-        def callback():
-            path = f"admin/wireless?&form=guest&form={wifi.value}"
-            data = f"operation=write&{wifi.value}_enable={'on' if enable else 'off'}"
-            self._send_data(path, data)
-
-        self._request(callback)
-
-    def reboot(self) -> None:
-        def callback():
-            self._send_data('admin/system?form=reboot', 'operation=write')
-
-        self._request(callback)
-
-    def authorize(self) -> bool:
-        referer = '{}/webpages/login.html?t=1596185370610'.format(self.host)
-
-        if self._pwdNN == '':
-            self._request_pwd(referer)
-
-        if self._seq == '':
-            self._request_seq(referer)
-
-        response = self._try_login(referer)
-
-        if 'text/plain' in response.headers.get('Content-Type'):
-            self._request_pwd(referer)
-            self._request_seq(referer)
-            response = self._try_login(referer)
-
-        try:
-            jsonData = response.json()
-
-            if 'data' not in jsonData or not jsonData['data']:
-                raise Exception('No data in response: ' + response.text)
-
-            encryptedResponseData = jsonData['data']
-            responseData = self._encryption.aes_decrypt(encryptedResponseData)
-
-            responseDict = json.loads(responseData)
-
-            if 'success' not in responseDict or not responseDict['success']:
-                raise Exception('No data in response: ' + responseData)
-
-            self._stok = responseDict['data']['stok']
-            regex_result = re.search(
-                'sysauth=(.*);', response.headers['set-cookie'])
-            self._sysauth = regex_result.group(1)
-            self._logged = True
+        if ret_code == self.HTTP_RET_OK:
+            self.token = None
             return True
-        except (ValueError, KeyError, AttributeError) as e:
-            if self._logger:
-                self._logger.error("TplinkRouter Integration Exception - Couldn't fetch auth tokens! Response was: %s",
-                                   response.text)
 
         return False
 
-    def logout(self) -> None:
-        if self._logged:
-            self._send_data('admin/system?form=logout', 'operation=write')
-        self.clear()
+    def get_dsl_status(self):
+        '''
+        Obtains DSL status info from the host
+        '''
+        acts = [
+            self.ActItem(self.ACT_GET, 'WAN_DSL_INTF_CFG', stack = '1,0,0,0,0,0', attrs = [
+                'status',
+                'modulationType',
+                'X_TP_AdslModulationCfg',
+                'upstreamCurrRate',
+                'downstreamCurrRate',
+                'X_TP_AnnexType',
+                'upstreamMaxRate',
+                'downstreamMaxRate',
+                'upstreamNoiseMargin',
+                'downstreamNoiseMargin',
+                'upstreamAttenuation',
+                'downstreamAttenuation',
+                'X_TP_UpTime'
+            ]),
+            self.ActItem(self.ACT_GET, 'WAN_DSL_INTF_STATS_TOTAL', stack = '1,0,0,0,0,0', attrs = [
+                'ATUCCRCErrors',
+                'CRCErrors',
+                'ATUCFECErrors',
+                'FECErrors',
+                'SeverelyErroredSecs',
+                'X_TP_US_SeverelyErroredSecs',
+                'erroredSecs',
+                'X_TP_US_ErroredSecs'
+            ])
+        ]
 
-    def clear(self) -> None:
-        self._stok = ''
-        self._sysauth = ''
-        self._logged = False
+        _, values = self.__req_act(acts)
+        return values
+    
+    def get_clients(self):
+        '''
+        Obtains DSL status info from the host
+        '''
+        acts = [
+            #self.ActItem(self.ACT_GL, 'ONEMESH_DEVICE'),
+            self.ActItem(self.ACT_GL, 'LAN_HOST_ENTRY')
+        ]
 
-    def _get_firmware(self) -> Firmware:
-        data = self._get_data('admin/firmware?form=upgrade', 'operation=read')
-        firmware = Firmware(data.get('hardware_version', ''), data.get('model', ''), data.get('firmware_version', ''))
+        _, values = self.__req_act(acts)
+        return values
+    
+    def logout(self):
+        acts = [
+            #self.ActItem(self.ACT_GL, 'ONEMESH_DEVICE'),
+            self.ActItem(self.ACT_CGI, '/cgi/logout')
+        ]
 
-        return firmware
+        _, values = self.__req_act(acts)
+        return values
+    
+    def get_firmware(self):
+        acts = [
+            self.ActItem(self.ACT_GET, 'IGD_DEV_INFO', attrs = [
+                'hardwareVersion',
+                'softwareVersion'
+            ])
+        ]
+        _, values = self.__req_act(acts)
+        return values
+    
+    def get_ipv4_dhcp_leases(self):
+    
+        acts = [
+            self.ActItem(self.ACT_GL, 'LAN_WLAN', attrs = [
+                'Enable',
+                'X_TP_Band'
+            ]),
+            self.ActItem(self.ACT_GS, 'LAN_HOST_ENTRY')
+        ]
+        
+        _, values = self.__req_act(acts)
+        
+        results = {}
+        i = 0
+        for index in values:
+            if "MACAddress" in values[index].keys() and values[index]['active'] == '1':
+                results[i] = {
+                    'macaddr': values[index]['MACAddress'],
+                    'macaddress': macaddress.MAC(values[index]['MACAddress']),
+                    'ipaddr': values[index]['IPAddress'],
+                    'ipaddress': ipaddress.ip_address(values[index]['IPAddress']),
+                    'hostname': values[index]['hostName'],
+                    'lease_time': values[index]['leaseTimeRemaining'],
+                }
+            i = i+1
+        pprint.pprint(results)
+        return values
+            
 
-    def _get_status(self) -> Status:
+    def __req_act(self, acts = []):
+        '''
+        Requests ACTs via the cgi_gdpr proxy
+        '''
+        act_types = []
+        act_data = []
 
-        def _calc_cpu_usage(data: dict) -> float | None:
-            cpu_usage = (data.get('cpu_usage', 0) + data.get('cpu1_usage', 0)
-                         + data.get('cpu2_usage', 0) + data.get('cpu3_usage', 0))
-            return cpu_usage / 4 if cpu_usage != 0 else None
+        for act in acts:
+            act_types.append(str(act.type))
+            act_data.append('[{}#{}#{}]{},{}\r\n{}\r\n'.format(
+                act.oid,
+                act.stack,
+                act.pstack,
+                len(act_types) - 1, # index, starts at 0
+                len(act.attrs),
+                '\r\n'.join(act.attrs)
+            ))
 
-        data = self._get_data('admin/status?form=all', 'operation=read')
-        status = Status()
-        status.devices = []
-        status._wan_macaddr = macaddress.EUI48(data['wan_macaddr']) if 'wan_macaddr' in data else None
-        status._lan_macaddr = macaddress.EUI48(data['lan_macaddr'])
-        status._wan_ipv4_addr = ipaddress.IPv4Address(data['wan_ipv4_ipaddr']) if 'wan_ipv4_ipaddr' in data else None
-        status._lan_ipv4_addr = ipaddress.IPv4Address(data['lan_ipv4_ipaddr']) if 'lan_ipv4_ipaddr' in data else None
-        status._wan_ipv4_gateway = ipaddress.IPv4Address(
-            data['wan_ipv4_gateway']) if 'wan_ipv4_gateway' in data else None
-        status.wan_ipv4_uptime = data.get('wan_ipv4_uptime')
-        status.mem_usage = data.get('mem_usage')
-        status.cpu_usage = _calc_cpu_usage(data)
-        status.wired_total = len(data.get('access_devices_wired', []))
-        status.wifi_clients_total = len(data.get('access_devices_wireless_host', []))
-        status.guest_clients_total = len(data.get('access_devices_wireless_guest', []))
-        status.clients_total = status.wired_total + status.wifi_clients_total + status.guest_clients_total
-        status.guest_2g_enable = data.get('guest_2g_enable') == 'on'
-        status.guest_5g_enable = data.get('guest_5g_enable') == 'on'
-        status.iot_2g_enable = data.get('iot_2g_enable') == 'on' if data.get('iot_2g_enable') is not None else None
-        status.iot_5g_enable = data.get('iot_5g_enable') == 'on' if data.get('iot_5g_enable') is not None else None
-        status.wifi_2g_enable = data.get('wireless_2g_enable') == 'on'
-        status.wifi_5g_enable = data.get('wireless_5g_enable') == 'on'
+        data = '&'.join(act_types) + '\r\n' + ''.join(act_data)
 
-        for item in data.get('access_devices_wireless_host', []):
-            type = Wifi.WIFI_2G if '2.4G' == item['wire_type'] else Wifi.WIFI_5G
-            status.devices.append(Device(type, macaddress.EUI48(item['macaddr']), ipaddress.IPv4Address(item['ipaddr']),
-                                         item['hostname']))
+        url = self.get_url('cgi_gdpr')
+        (code, response) = self.__request(url, data_str = data, encrypt = True)
+        assert code == 200
 
-        for item in data.get('access_devices_wireless_guest', []):
-            type = Wifi.WIFI_GUEST_2G if '2.4G' == item['wire_type'] else Wifi.WIFI_GUEST_5G
-            status.devices.append(Device(type, macaddress.EUI48(item['macaddr']), ipaddress.IPv4Address(item['ipaddr']),
-                                         item['hostname']))
+        # TODO: Implement response parsing for other ACT types (not just ACT_GET)
+        result = {}
+        lines = response.split('\n')
+        if act_types[0] == str(self.ACT_GL):
+            i = 0
+            for l in lines:
+                if '=' in l:
+                    keyval = l.split('=')
+                    assert len(keyval) == 2
+                    if not i in result.keys():
+                        result[i] = {}
+                    if keyval[0] in result[i].keys():
+                        i = i+1
+                        result[i] = {}
+                    result[i][keyval[0]] = keyval[1]
+        else:
+            for l in lines:
+                if '=' in l:
+                    keyval = l.split('=')
+                    assert len(keyval) == 2
 
-        return status
+                    result[keyval[0]] = keyval[1]
 
-    def _get_ipv4_status(self) -> IPv4Status:
-        ipv4_status = IPv4Status()
-        data = self._get_data('admin/network?form=status_ipv4', 'operation=read')
-        ipv4_status._wan_macaddr = macaddress.EUI48(data['wan_macaddr'])
-        ipv4_status._wan_ipv4_ipaddr = ipaddress.IPv4Address(data['wan_ipv4_ipaddr'])
-        ipv4_status._wan_ipv4_gateway = ipaddress.IPv4Address(data['wan_ipv4_gateway'])
-        ipv4_status.wan_ipv4_conntype = data['wan_ipv4_conntype']
-        ipv4_status._wan_ipv4_netmask = ipaddress.IPv4Address(data['wan_ipv4_netmask'])
-        ipv4_status._wan_ipv4_pridns = ipaddress.IPv4Address(data['wan_ipv4_pridns'])
-        ipv4_status._wan_ipv4_snddns = ipaddress.IPv4Address(data['wan_ipv4_snddns'])
-        ipv4_status._lan_macaddr = macaddress.EUI48(data['lan_macaddr'])
-        ipv4_status._lan_ipv4_ipaddr = ipaddress.IPv4Address(data['lan_ipv4_ipaddr'])
-        ipv4_status.lan_ipv4_dhcp_enable = self._str2bool(data['lan_ipv4_dhcp_enable'])
-        ipv4_status._lan_ipv4_netmask = ipaddress.IPv4Address(data['lan_ipv4_netmask'])
-        ipv4_status.remote = self._str2bool(data['remote'])
+        return (response, result)
 
-        return ipv4_status
+    def __req_token(self):
+        '''
+        Requests the TokenID, used for CGI authentication (together with cookies)
+            - token is inlined as JS var in the index (/) html page
+              e.g.: <script type="text/javascript">var token="086724f57013f16e042e012becf825";</script>
 
-    def _get_ipv4_reservations(self) -> [IPv4Reservation]:
-        ipv4_reservations = []
-        data = self._get_data('admin/dhcps?form=reservation', 'operation=load')
+        Return value:
+            TokenID string
+        '''
+        url = self.get_url('')
+        (code, response) = self.__request(url, method = 'GET')
+        assert code == 200
 
-        for item in data:
-            ipv4_reservations.append(
-                IPv4Reservation(macaddress.EUI48(item['mac']), ipaddress.IPv4Address(item['ip']), item['comment'],
-                                self._str2bool(item['enable'])))
+        result = re.search(self.REGEX_TOKEN, response)
+        assert result is not None
+        assert result.group(1) != ''
 
-        return ipv4_reservations
+        return result.group(1)
 
-    def _get_ipv4_dhcp_leases(self) -> [IPv4DHCPLease]:
-        dhcp_leases = []
-        data = self._get_data('admin/dhcps?form=client', 'operation=load')
+    def __req_rsa_key(self):
+        '''
+        Requests the RSA public key from the host
 
-        for item in data:
-            dhcp_leases.append(
-                IPv4DHCPLease(macaddress.EUI48(item['macaddr']), ipaddress.IPv4Address(item['ipaddr']), item['name'],
-                              item['leasetime']))
+        Return value:
+            ((n, e), seq) tuple
+        '''
+        url = self.get_url('cgi/getParm')
+        (code, response) = self.__request(url)
+        assert code == 200
 
-        return dhcp_leases
+        # assert return code
+        assert self.__parse_ret_val(response) == self.HTTP_RET_OK
 
-    def _query(self, query, operation):
-        data = self._get_data(query, operation)
+        # parse public key
+        result = re.search(self.REGEX_GET_PARM, response)
+        assert result is not None
+        assert len(result.group(1)) == 6 # ee
+        assert len(result.group(2)) == 128 # nn
+        assert result.group(3).isnumeric() # seq
 
-        # for item in data:
-        #    dhcp_leases.append(IPv4DHCPLease(macaddress.EUI48(item['macaddr']), ipaddress.IPv4Address(item['ipaddr']), item['name'], item['leasetime']))
+        return ((result.group(2), result.group(1)), int(result.group(3)))
 
-        return data
+    def __req_check_busy(self):
+        '''
+        Checks if the host is busy or someone else is logged in
 
-    # TODO
-    #        data2 = self._get_data('admin/dhcps?form=setting', 'operation=read')
+        Return value:
+            (is_logged_in, is_busy) boolean tuple
+        '''
+        url = self.get_url('cgi/getBusy')
+        (code, response) = self.__request(url)
+        assert code == 200
 
-    def _str2bool(self, v):
-        return str(v).lower() in ("yes", "true", "on")
+        # assert return code
+        assert self.__parse_ret_val(response) == self.HTTP_RET_OK
 
-    def _request_pwd(self, referer: str) -> None:
-        url = '{}/cgi-bin/luci/;stok=/login?form=keys'.format(self.host)
+        # parse the is_logged_in / is_busy values
+        result = re.search(self.REGEX_GET_BUSY, response)
+        assert result is not None
+        assert int(result.group(1)) in [0, 1]
+        assert int(result.group(2)) in [0, 1]
 
-        # If possible implement RSA encryption of password here.
-        response = requests.post(
-            url, params={'operation': 'read'},
-            headers={'Referer': referer},
-            timeout=self.timeout,
-            verify=self._verify_ssl,
-        )
+        return (int(result.group(1)) == 1, int(result.group(2)) == 1)
 
-        try:
-            data = response.json()
+    def __req_login(self, username, password):
+        '''
+        Authenticates to the host
+            - sets the session token after successful login
+            - data/signature is passed as a GET parameter, NOT as a raw request data
+              (unlike for regular encrypted requests to the /cgi_gdpr endpoint)
 
-            args = data['data']['password']
+        Example session token (set as a cookie):
+            {'JSESSIONID': '4d786fede0164d7613411c7b6ec61e'}
+        '''
+        # encrypt username + password
+        encrypted_data = self.__encrypt_data(username + '\n' + password)
 
-            self._pwdNN = args[0]
-            self._pwdEE = args[1]
-        except json.decoder.JSONDecodeError:
-            if self._logger:
-                self._logger.error('TplinkRouter Integration Exception - No pwd response - {}'.format(response.text))
-            raise Exception('Unsupported router!')
-        except Exception as error:
-            raise Exception('Unknown error for pwd - {}; Response - {}'.format(error, response.text))
+        # get encrypted signature
+        signature = self.__get_signature(len(encrypted_data), True)
+        assert len(signature) == 256
 
-    def _request_seq(self, referer: str) -> None:
-        url = '{}/cgi-bin/luci/;stok=/login?form=auth'.format(self.host)
+        data = {
+            'data': urllib.parse.quote(encrypted_data, safe='~()*!.\''),
+            'sign': signature,
+            'Action': 1,
+            'LoginStatus': 0,
+            'isMobile': 0
+        }
 
-        # If possible implement RSA encryption of password here.
-        response = requests.post(
-            url,
-            params={'operation': 'read'},
-            headers={'Referer': referer},
-            timeout=self.timeout,
-            verify=self._verify_ssl,
-        )
+        url = self.get_url('cgi/login', data)
+        (code, response) = self.__request(url)
+        assert code == 200
 
-        try:
-            data = response.json()
+        # parse and match return code
+        ret_code = self.__parse_ret_val(response)
 
-            self._seq = data['data']['seq']
-            args = data['data']['key']
+        if ret_code == self.HTTP_ERR_USER_PWD_NOT_CORRECT:
+            info = re.search(self.REGEX_PWD_NOT_CORRENT_INFO, response)
+            assert info is not None
 
-            self.nn = args[0]
-            self.ee = args[1]
-        except json.decoder.JSONDecodeError:
-            if self._logger:
-                self._logger.error('TplinkRouter Integration Exception - No seq response - {}'.format(response.text))
-            raise Exception('Unsupported router!')
-        except Exception as error:
-            raise Exception('Unknown error for seq - {}; Response - {}'.format(error, response.text))
+            raise LoginException('Login failed, wrong password. Auth times: {}/5, Forbid time: {}'.format(info.group(1), info.group(2)))
+        elif ret_code == self.HTTP_ERR_USER_BAD_REQUEST:
+            raise LoginException('Login failed. Generic error code: {}'.format(ret_code))
+        elif ret_code != self.HTTP_RET_OK:
+            raise LoginException('Login failed. Unknown error code: {}'.format(ret_code))
 
-    def _try_login(self, referer: str) -> requests.Response:
-        url = '{}/cgi-bin/luci/;stok=/login?form=login'.format(self.host)
+        self.logger.debug('Login Cookies: {}'.format(self.req.cookies.get_dict()))
+        return True
 
-        cryptedPwd = self._encryption.rsa_encrypt(self.password, self._pwdNN, self._pwdEE)
-        data = 'operation=login&password={}&confirm=true'.format(cryptedPwd)
+    def __request(self, url, method = 'POST', data_str = None, encrypt = False):
+        '''
+        Prepares and sends an HTTP request to the host
+            - sets up the headers, handles token auth
+            - encrypts/decrypts the data, if needed
 
-        body = self._prepare_data(data)
+        Return value:
+            (status_code, response_text) tuple
+        '''
+        headers = self.HEADERS
 
-        return requests.post(
-            url,
-            data=body,
-            headers={'Referer': referer, 'Content-Type': 'application/x-www-form-urlencoded'},
-            timeout=self.timeout,
-            verify=self._verify_ssl,
-        )
+        # add referer to request headers,
+        # otherwise we get 403 Forbidden
+        headers['Referer'] = 'http://{}/'.format(self.host)
 
-    def _prepare_data(self, data) -> dict:
-        encrypted_data = self._encryption.aes_encrypt(data)
-        data_len = len(encrypted_data)
+        # add token to request headers,
+        # used for CGI auth (together with JSESSIONID cookie)
+        if self.token is not None:
+            headers['TokenID'] = self.token
 
-        sign = self._encryption.get_signature(int(self._seq) + data_len, self._logged == False, self._hash, self.nn,
-                                              self.ee)
+        # encrypt request data if needed (for the /cgi_gdpr endpoint)
+        if encrypt:
+            # encrypt the data
+            encrypted_data = self.__encrypt_data(data_str)
 
-        return {'sign': sign, 'data': encrypted_data}
+            # get encrypted signature
+            signature = self.__get_signature(len(encrypted_data), False)
 
-    def _request(self, callback: Callable):
-        if not self.single_request_mode:
-            return callback()
+            # format expected raw request data
+            data = 'sign={}\r\ndata={}\r\n'.format(signature, encrypted_data)
+        else:
+            data = data_str
 
-        try:
-            if self.authorize():
-                data = callback()
-                self.logout()
-                return data
-        except Exception as error:
-            self._seq = ''
-            self._pwdNN = ''
-            if self._logger:
-                self._logger.error('TplinkRouter Integration Exception - {}'.format(error))
-        finally:
-            self.clear()
-
-    def _get_data(self, path: str, data: str = 'operation=read') -> dict | None:
-        if self._logged is False:
-            raise Exception('Not authorised')
-        url = '{}/cgi-bin/luci/;stok={}/{}'.format(self.host, self._stok, path)
-        referer = '{}/webpages/index.html'.format(self.host)
-
-        response = requests.post(
-            url,
-            data=self._prepare_data(data),
-            headers={'Referer': referer},
-            cookies={'sysauth': self._sysauth},
-            timeout=self.timeout,
-            verify=self._verify_ssl,
-        )
-
-        data = response.text
-        try:
-            json_response = response.json()
-            if 'data' not in json_response:
-                raise Exception("Router didn't respond with JSON - " + data)
-            data = self._encryption.aes_decrypt(json_response['data'])
-
-            json_response = json.loads(data)
-
-            if 'success' in json_response and json_response['success']:
-                return json_response['data']
+        retry = 0
+        while retry < self.REQUEST_RETRIES:
+            # send the request
+            if method == 'POST':
+                r = self.req.post(url, data = data, headers = headers)
+            elif method == 'GET':
+                r = self.req.get(url, data = data, headers = headers)
             else:
-                if 'errorcode' in json_response and json_response['errorcode'] == 'timeout':
-                    if self._logger:
-                        self._logger.info(
-                            "TplinkRouter Integration Exception - Token timed out. Relogging on next scan")
-                    self._stok = ''
-                    self._sysauth = ''
-                elif self._logger:
-                    self._logger.error(
-                        "TplinkRouter Integration Exception - An unknown error happened while fetching data %s", data)
-        except ValueError:
-            if self._logger:
-                self._logger.error(
-                    "TplinkRouter Integration Exception - Router didn't respond with JSON. Check if credentials are correct")
+                raise Exception('Unsupported method ' + str(method))
 
-        raise Exception('An unknown response - ' + data)
+            # sometimes we get 500 here, not sure why... just retry the request
+            if r.status_code != 500 and '<title>500 Internal Server Error</title>' not in r.text:
+                break
 
-    def _send_data(self, path: str, data: str) -> None:
-        if self._logged is False:
-            raise Exception('Not authorised')
-        url = '{}/cgi-bin/luci/;stok={}/{}'.format(self.host, self._stok, path)
-        referer = '{}/webpages/index.1596185370610.html'.format(self.host)
+            time.sleep(0.05)
+            retry += 1
 
-        body = self._prepare_data(data)
-        requests.post(
-            url,
-            data=body,
-            headers={'Referer': referer, 'Content-Type': 'application/x-www-form-urlencoded'},
-            cookies={'sysauth': self._sysauth},
-            timeout=self.timeout,
-            verify=self._verify_ssl,
-        )
+        self.logger.debug('<Request  {}>'.format(r.url))
+        self.logger.debug(r)
+        self.logger.debug(r.text[:256])
+
+        # decrypt the response, if needed
+        if encrypt and (r.status_code == 200) and (r.text != ''):
+            return (r.status_code, self.__decrypt_data(r.text))
+        else:
+            return (r.status_code, r.text)
+
+    def __encrypt_data(self, data_str):
+        '''
+        Encrypts data string using AES
+        '''
+        # pad to a multiple of 16 with pkcs7
+        data_padded = pad(data_str.encode('utf8'), 16, 'pkcs7')
+
+        # encrypt the body
+        aes_encryptor = self.__make_aes_cipher(self.aes_key)
+        encrypted_data_bytes = aes_encryptor.encrypt(data_padded)
+
+        # encode encrypted binary data to base64
+        return b64encode(encrypted_data_bytes).decode('utf8')
+
+    def __decrypt_data(self, data_str):
+        '''
+        Decrypts the raw response data string using AES
+        '''
+        # decode base64 string
+        encrypted_response_data = b64decode(data_str)
+
+        # decrypt the response using our AES key
+        aes_decryptor = self.__make_aes_cipher(self.aes_key)
+        response = aes_decryptor.decrypt(encrypted_response_data)
+
+        # unpad using pkcs7
+        return unpad(response, 16, 'pkcs7').decode('utf8')
+
+    def __get_signature(self, body_data_len, is_login = False):
+        '''
+        Formats and encrypts the signature using the RSA pub key
+            body_data_len: length of the encrypted body message
+            is_login:      set to True for login request
+
+        Return value:
+            RSA encrypted signature as string
+        '''
+        if is_login:
+            # on login we also send our AES key, which is subsequently
+            # used for E2E encrypted communication
+            aes_key, aes_iv = self.aes_key
+
+            sign_data = 'key={}&iv={}&h={}&s={}'.format(aes_key, aes_iv, self.md5_hash_pw, self.seq + body_data_len)
+        else:
+            sign_data = 'h={}&s={}'.format(self.md5_hash_pw, self.seq + body_data_len)
+
+        # set step based on whether PKCS padding is used
+        rsa_byte_len = len(self.rsa_key[0]) // 2 # hexlen / 2 * 8 / 8
+        step = (rsa_byte_len - 11) if self.RSA_USE_PKCS_V1_5 else rsa_byte_len
+
+        # encrypt the signature using the RSA public key
+        rsa_key = self.__make_rsa_pub_key(self.rsa_key)
+
+        # make the PKCS#1 v1.5 cipher
+        if self.RSA_USE_PKCS_V1_5:
+            rsa = PKCS1_v1_5.new(rsa_key)
+
+        signature = ''
+        pos = 0
+
+        while pos < len(sign_data):
+            sign_data_bin = sign_data[pos : pos+step].encode('utf8')
+
+            if self.RSA_USE_PKCS_V1_5:
+                # encrypt using the PKCS#1 v1.5 padding
+                enc = rsa.encrypt(sign_data_bin)
+            else:
+                # encrypt using NOPADDING
+                # ... pad the end with zero bytes
+                while len(sign_data_bin) < step:
+                    sign_data_bin = sign_data_bin + b'\0'
+
+                # step 3a (OS2IP)
+                em_int = bytes_to_long(sign_data_bin)
+
+                # step 3b (RSAEP)
+                m_int = rsa_key._encrypt(em_int)
+
+                # step 3c (I2OSP)
+                enc = long_to_bytes(m_int, 1)
+
+            # hexlify to string
+            enc_str = binascii.hexlify(enc).decode('utf8')
+
+            # pad the start with '0' hex char
+            while len(enc_str) < rsa_byte_len * 2:
+                enc_str = '0' + enc_str
+
+            signature += enc_str
+            pos = pos + step
+
+        return signature
+
+    def __parse_ret_val(self, response_text):
+        '''
+        Parses $.ret value from the response text
+
+        Return value:
+            return code (int)
+        '''
+        result = re.search(self.REGEX_RETURN_VALUE, response_text)
+        assert result is not None
+        assert result.group(1).isnumeric()
+
+        return int(result.group(1))
+
+    def __hash_pw(self, username = 'admin', password = None):
+        '''
+        Hashes the username and password using MD5
+
+        Return value:
+            hex string of the MD5 hash (len: 32)
+        '''
+        md5 = MD5.new()
+
+        if password is not None:
+            md5.update((username + password).encode('utf8'))
+        else:
+            md5.update(username)
+
+        result = md5.hexdigest()
+        assert len(result) == 32
+
+        return result
+
+    def __gen_aes_key(self):
+        '''
+        Generates a pseudo-random AES key
+
+        Return value:
+            (key, iv) tuple
+        '''
+        ts = str(round(time.time() * 1000))
+
+        key = (ts + str(random.randint(100000000, 1000000000-1)))[:self.AES_KEY_LEN]
+        iv = (ts + str(random.randint(100000000, 1000000000-1)))[:self.AES_IV_LEN]
+
+        assert len(key) == self.AES_KEY_LEN
+        assert len(iv) == self.AES_IV_LEN
+
+        return (key, iv)
+
+    def __make_aes_cipher(self, aes_key):
+        '''
+        Makes a new cipher from AES key tuple (key, iv)
+        '''
+        key, iv = aes_key
+
+        # CBC mode, PKCS7 padding
+        return AES.new(key.encode('utf8'), AES.MODE_CBC, iv = iv.encode('utf8'))
+
+    def __make_rsa_pub_key(self, key):
+        '''
+        Makes a new RSA pub key from tuple (n, e)
+        '''
+        n = int('0x' + key[0], 16)
+        e = int('0x' + key[1], 16)
+        return RSA.construct((n, e))
+
+    
