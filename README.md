@@ -1,5 +1,5 @@
-# TP-Link Router API
-Python package for API access and management for TP-Link Router
+# [WIP] TP-Link Router API
+Python package for API access and management for TP-Link Router using the "GDPR Proxy"
 
 [![Pypi](https://img.shields.io/pypi/v/tplinkrouterc6u)](https://pypi.org/project/tplinkrouterc6u/)
 [![Downloads](https://static.pepy.tech/personalized-badge/tplinkrouterc6u?period=total&units=international_system&left_color=grey&right_color=orange&left_text=Downloads)](https://pypi.org/project/tplinkrouterc6u/)
@@ -7,7 +7,7 @@ Python package for API access and management for TP-Link Router
 See [Supported routers](#supports)
 
 ## Installation
-`pip install tplinkrouterc6u`
+`pip install tplinkroutergdpr`
 `pip install -r requirements.txt`
 
 ## Dependencies
@@ -18,10 +18,10 @@ See [Supported routers](#supports)
 Enter the host & credentials used to log in to your router management page. Username is admin by default. But you may pass username as third parameter
 
 ```python
-from tplinkrouterc6u import TplinkRouter, Wifi
+from tplinkroutergdpr import TplinkRouter, Wifi
 from logging import Logger
 
-router = TplinkRouter('http://192.168.0.1', 'password')
+router = TplinkRouterGDPR('http://192.168.0.1', 'password')
 
 # You may also pass username if it is different and a logger to log errors as
 # TplinkRouter('http://192.168.0.1','password','admin2', Logger('test'))
@@ -54,9 +54,9 @@ So before action client authorize and after logout
 To reduce authorization requests client allows to make several actions with one authorization
 
 ```python
-from tplinkrouterc6u import TplinkRouter, Wifi
+from tplinkroutergdpr import TplinkRouter, Wifi
 
-router = TplinkRouter('http://192.168.0.1', 'password', timeout)
+router = TplinkRouterGDPR('http://192.168.0.1', 'password', timeout)
 router.single_request_mode = False  # make client use single authorization
 
 
@@ -70,19 +70,19 @@ try:
 ```
 
 ## Functions
-| Function | Args | Description | Return |
+|Status | Function | Args | Description | Return |
 |--|--|--|--|
-| get_firmware |  | Gets firmware info about the router | [Firmware](#firmware) |
-| get_status |  | Gets status about the router info including wifi statuses and wifi clients info | [Status](#status) |
-| get_full_info |  | Gets firmware and status info | tuple[[Firmware](#firmware),[Status](#status)] |
-| get_ipv4_status | | Gets WAN and LAN IPv4 status info, gateway, DNS, netmask | [IPv4Status](#IPv4Status) |
-| get_ipv4_reservations| | Gets IPv4 reserved addresses (static) | [[IPv4Reservation]](#IPv4Reservation) |
-| get_ipv4_dhcp_leases | | Gets IPv4 addresses assigned via DHCP | [[IPv4DHCPLease]](#IPv4DHCPLease) | 
-| set_wifi | wifi: [Wifi](#wifi), enable: bool | Allow to turn on/of 4 wifi networks |  |
-| reboot |  | reboot router |
-| authorize |  | authorize for actions |
-| logout |  | logout after all is done |
-| query | query, operation='operation=read' | execute cgi-bin query | dictionary of result or None |
+| implemented | get_firmware |  | Gets firmware info about the router | [Firmware](#firmware) |
+| TODO | get_status |  | Gets status about the router info including wifi statuses and wifi clients info | [Status](#status) |
+| TODO | get_full_info |  | Gets firmware and status info | tuple[[Firmware](#firmware),[Status](#status)] |
+| TODO | get_ipv4_status | | Gets WAN and LAN IPv4 status info, gateway, DNS, netmask | [IPv4Status](#IPv4Status) |
+| TODO | get_ipv4_reservations| | Gets IPv4 reserved addresses (static) | [[IPv4Reservation]](#IPv4Reservation) |
+| implemented | get_ipv4_dhcp_leases | | Gets IPv4 addresses assigned via DHCP | [[IPv4DHCPLease]](#IPv4DHCPLease) | 
+| TODO | set_wifi | wifi: [Wifi](#wifi), enable: bool | Allow to turn on/of 4 wifi networks |  |
+| TODO | reboot |  | reboot router |
+| implemented || connect |  | authorize for actions |
+| implemented || logout |  | logout after all is done |
+| todo || query | query, operation='operation=read' | execute cgi-bin query | dictionary of result or None |
 
 ## Dataclass
 ### <a id="firmware">Firmware</a>
